@@ -86,11 +86,11 @@ export class AgentSideConnection {
           return agent.listSessions(validatedParams);
         }
         case schema.AGENT_METHODS.session_delete: {
-          if (!agent.unstable_deleteSession) {
+          if (!agent.deleteSession) {
             throw RequestError.methodNotFound(method);
           }
           const validatedParams = validate.zDeleteSessionRequest.parse(params);
-          const result = await agent.unstable_deleteSession(validatedParams);
+          const result = await agent.deleteSession(validatedParams);
           return result ?? {};
         }
         case schema.AGENT_METHODS.session_fork: {
@@ -827,17 +827,11 @@ export class ClientSideConnection implements Agent {
   }
 
   /**
-   * **UNSTABLE**
-   *
-   * This capability is not part of the spec yet, and may be removed or changed at any point.
-   *
    * Deletes an existing session returned by `session/list`.
    *
    * This method is only available if the agent advertises the `sessionCapabilities.delete` capability.
-   *
-   * @experimental
    */
-  unstable_deleteSession(
+  deleteSession(
     params: schema.DeleteSessionRequest,
   ): Promise<schema.DeleteSessionResponse> {
     return this.connection.sendRequest<
@@ -1003,11 +997,7 @@ export class ClientSideConnection implements Agent {
   }
 
   /**
-   * Terminates the current authenticated session.
-   *
-   * **UNSTABLE**: This capability is not part of the spec yet, and may be removed or changed at any point.
-   *
-   * @experimental
+   * Logout of the current authentication method.
    */
   logout(params: schema.LogoutRequest): Promise<schema.LogoutResponse> {
     return this.connection.sendRequest<
@@ -1998,17 +1988,11 @@ export interface Agent {
     params: schema.ListSessionsRequest,
   ): Promise<schema.ListSessionsResponse>;
   /**
-   * **UNSTABLE**
-   *
-   * This capability is not part of the spec yet, and may be removed or changed at any point.
-   *
    * Deletes an existing session returned by `session/list`.
    *
    * This method is only available if the agent advertises the `sessionCapabilities.delete` capability.
-   *
-   * @experimental
    */
-  unstable_deleteSession?(
+  deleteSession?(
     params: schema.DeleteSessionRequest,
   ): Promise<schema.DeleteSessionResponse | void>;
   /**
@@ -2120,13 +2104,8 @@ export interface Agent {
     params: schema.DisableProviderRequest,
   ): Promise<schema.DisableProviderResponse | void>;
   /**
-   * Terminates the current authenticated session.
-   *
-   * **UNSTABLE**: This capability is not part of the spec yet, and may be removed or changed at any point.
-   *
-   * @experimental
+   * Logout of the current authentication method.
    */
-
   logout?(params: schema.LogoutRequest): Promise<schema.LogoutResponse | void>;
   /**
    * Processes a user prompt within a session.
