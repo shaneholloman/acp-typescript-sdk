@@ -59,6 +59,22 @@ export type AnyNotification = {
   params?: unknown;
 };
 
+const CANCEL_REQUEST_METHOD = "$/cancel_request";
+type JsonRpcId = string | number | null;
+
+/**
+ * Options for sending a JSON-RPC request.
+ */
+export type SendRequestOptions = {
+  /**
+   * Aborting this signal sends `$/cancel_request` for the outgoing request.
+   * Cancellation is cooperative: the returned promise is still settled by the
+   * peer's eventual response, which may be a normal result, partial result, or
+   * `RequestError.requestCancelled()`.
+   */
+  cancellationSignal?: AbortSignal;
+};
+
 /**
  * JSON-RPC result payload, either a successful result or an error.
  */
@@ -176,6 +192,14 @@ function isJsonRpcId(value: unknown): value is string | number | null {
   );
 }
 
+function cancelRequestId(params: unknown): JsonRpcId | undefined {
+  if (!isRecord(params) || !isJsonRpcId(params["requestId"])) {
+    return undefined;
+  }
+
+  return params["requestId"];
+}
+
 function isErrorResponse(value: unknown): value is ErrorResponse {
   return (
     isRecord(value) &&
@@ -188,6 +212,8 @@ function isErrorResponse(value: unknown): value is ErrorResponse {
 type ConnectionPendingResponse = {
   resolve: (response: unknown) => void;
   reject: (error: unknown) => void;
+  cleanup?: () => void;
+  cancellationSent?: boolean;
 };
 
 /**
@@ -215,6 +241,11 @@ export type IncomingRequest = {
    * Original wire request.
    */
   raw: AnyRequest;
+  /**
+   * AbortSignal that aborts when the peer sends `$/cancel_request` for this
+   * request or when the connection closes.
+   */
+  signal: AbortSignal;
   /**
    * Responder used to complete the request.
    */
@@ -383,6 +414,45 @@ function errorToResult<T>(error: unknown): Result<T> {
   }
 }
 
+function requestCancelledError(reason?: unknown): RequestError {
+  if (reason instanceof RequestError && reason.code === -32800) {
+    return reason;
+  }
+
+  return RequestError.requestCancelled(reason);
+}
+
+function errorToRequestResult<T>(
+  error: unknown,
+  signal: AbortSignal,
+): Result<T> {
+  const requestCancelled = abortErrorToRequestCancelled(error, signal);
+  return requestCancelled ? requestCancelled.toResult() : errorToResult(error);
+}
+
+function abortErrorToRequestCancelled(
+  error: unknown,
+  signal: AbortSignal,
+): RequestError | undefined {
+  if (!signal.aborted || !isAbortError(error)) {
+    return undefined;
+  }
+
+  return requestCancelledError(signal.reason);
+}
+
+function isAbortError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+
+  const maybeAbortError = error as { code?: unknown; name?: unknown };
+  return (
+    maybeAbortError.name === "AbortError" ||
+    maybeAbortError.code === "ABORT_ERR"
+  );
+}
+
 /**
  * Responder for one incoming JSON-RPC request.
  *
@@ -398,6 +468,11 @@ export class RequestResponder<Resp = unknown> {
      */
     public readonly id: string | number | null,
     private sendResult: (result: Result<Resp>) => Promise<void>,
+    /**
+     * AbortSignal for this incoming request.
+     */
+    public readonly signal: AbortSignal = new AbortController().signal,
+    private finishRequest?: () => void,
   ) {}
 
   /**
@@ -432,7 +507,9 @@ export class RequestResponder<Resp = unknown> {
     }
 
     this.didRespond = true;
-    return this.sendResult(result);
+    return this.sendResult(result).finally(() => {
+      this.finishRequest?.();
+    });
   }
 }
 
@@ -484,8 +561,9 @@ export class ConnectionContext {
     method: string,
     params?: Req,
     mapResponse?: (response: Resp) => Output,
+    options?: SendRequestOptions,
   ): Promise<Output> {
-    return this.connection.sendRequest(method, params, mapResponse);
+    return this.connection.sendRequest(method, params, mapResponse, options);
   }
 
   /**
@@ -493,6 +571,13 @@ export class ConnectionContext {
    */
   sendNotification<N>(method: string, params?: N): Promise<void> {
     return this.connection.sendNotification(method, params);
+  }
+
+  /**
+   * Sends a protocol-level request cancellation notification.
+   */
+  sendCancelRequest(requestId: JsonRpcId): Promise<void> {
+    return this.connection.sendCancelRequest(requestId);
   }
 
   /**
@@ -534,10 +619,9 @@ export type ConnectionOptions = {
  * class when building generic JSON-RPC middleware or custom dispatch behavior.
  */
 export class Connection {
-  private pendingResponses: Map<
-    string | number | null,
-    ConnectionPendingResponse
-  > = new Map();
+  private pendingResponses: Map<JsonRpcId, ConnectionPendingResponse> =
+    new Map();
+  private incomingRequests: Map<JsonRpcId, AbortController> = new Map();
   private nextRequestId = 0;
   private staticHandlers: JsonRpcHandler[] = [];
   private dynamicHandlers: Set<JsonRpcHandler> = new Set();
@@ -670,14 +754,16 @@ export class Connection {
     method: string,
     params?: Req,
     mapResponse?: (response: Resp) => Output,
+    options: SendRequestOptions = {},
   ): Promise<Output> {
     if (this.abortController.signal.aborted) {
       return rejectedPromise(this.closedReason());
     }
 
     const id = this.nextRequestId++;
+    let cancel = () => {};
     const responsePromise = new Promise<Output>((resolve, reject) => {
-      this.pendingResponses.set(id, {
+      const pendingResponse: ConnectionPendingResponse = {
         resolve: (response) => {
           try {
             const value = mapResponse
@@ -689,13 +775,45 @@ export class Connection {
           }
         },
         reject,
+      };
+
+      cancel = () => {
+        if (pendingResponse.cancellationSent) {
+          return;
+        }
+
+        pendingResponse.cancellationSent = true;
+        pendingResponse.cleanup?.();
+        void this.sendCancelRequest(id).catch(() => {});
+      };
+
+      options.cancellationSignal?.addEventListener("abort", cancel, {
+        once: true,
       });
+      pendingResponse.cleanup = () => {
+        options.cancellationSignal?.removeEventListener("abort", cancel);
+      };
+      this.pendingResponses.set(id, pendingResponse);
     });
     responsePromise.catch(() => {});
-    void this.sendMessage({ jsonrpc: "2.0", id, method, params }).catch(
-      () => {},
-    );
+    const requestSent = this.sendMessage({
+      jsonrpc: "2.0",
+      id,
+      method,
+      params,
+    });
+    void requestSent.catch(() => {});
+    if (options.cancellationSignal?.aborted) {
+      cancel();
+    }
     return responsePromise;
+  }
+
+  /**
+   * Sends a protocol-level request cancellation notification.
+   */
+  sendCancelRequest(requestId: JsonRpcId): Promise<void> {
+    return this.sendNotification(CANCEL_REQUEST_METHOD, { requestId });
   }
 
   /**
@@ -718,11 +836,16 @@ export class Connection {
     }
 
     const closeError: unknown = error ?? new Error("ACP connection closed");
+    this.abortController.abort(closeError);
     for (const pendingResponse of this.pendingResponses.values()) {
+      pendingResponse.cleanup?.();
       pendingResponse.reject(closeError);
     }
     this.pendingResponses.clear();
-    this.abortController.abort(closeError);
+    for (const controller of this.incomingRequests.values()) {
+      controller.abort(closeError);
+    }
+    this.incomingRequests.clear();
     void this.receiveReader?.cancel(closeError).catch(() => {});
   }
 
@@ -797,6 +920,9 @@ export class Connection {
     }
 
     if ("method" in message) {
+      if (!("id" in message)) {
+        this.handleProtocolNotification(message);
+      }
       void this.processIncomingMessage(this.toIncomingMessage(message)).catch(
         (error) => this.close(error),
       );
@@ -850,7 +976,9 @@ export class Connection {
       }
 
       if (current.kind === "request" && !current.responder.responded) {
-        await current.responder.respondWithResult(errorToResult(error));
+        await current.responder.respondWithResult(
+          errorToRequestResult(error, current.responder.signal),
+        );
       } else {
         const response = errorToResult(error);
         if ("error" in response) {
@@ -868,17 +996,30 @@ export class Connection {
     message: AnyRequest | AnyNotification,
   ): IncomingMessage {
     if ("id" in message) {
+      const abortController = new AbortController();
+      this.incomingRequests.set(message.id, abortController);
+      const finishRequest = () => {
+        if (this.incomingRequests.get(message.id) === abortController) {
+          this.incomingRequests.delete(message.id);
+        }
+      };
+
       return {
         kind: "request",
         method: message.method,
         params: message.params,
         raw: message,
-        responder: new RequestResponder(message.id, (result) =>
-          this.sendMessage({
-            jsonrpc: "2.0",
-            id: message.id,
-            ...result,
-          }),
+        signal: abortController.signal,
+        responder: new RequestResponder(
+          message.id,
+          (result) =>
+            this.sendMessage({
+              jsonrpc: "2.0",
+              id: message.id,
+              ...result,
+            }),
+          abortController.signal,
+          finishRequest,
         ),
       };
     }
@@ -894,6 +1035,9 @@ export class Connection {
   private handleResponse(response: AnyResponse): void {
     const pendingResponse = this.pendingResponses.get(response.id);
     if (pendingResponse) {
+      this.pendingResponses.delete(response.id);
+      pendingResponse.cleanup?.();
+
       if ("result" in response) {
         pendingResponse.resolve(response.result);
       } else if ("error" in response) {
@@ -902,10 +1046,27 @@ export class Connection {
       } else {
         pendingResponse.reject(RequestError.invalidRequest(response));
       }
-      this.pendingResponses.delete(response.id);
     } else {
       console.error("Got response to unknown request", response.id);
     }
+  }
+
+  private handleProtocolNotification(message: AnyNotification): void {
+    if (message.method !== CANCEL_REQUEST_METHOD) {
+      return;
+    }
+
+    const requestId = cancelRequestId(message.params);
+    if (requestId === undefined) {
+      return;
+    }
+
+    const controller = this.incomingRequests.get(requestId);
+    if (!controller || controller.signal.aborted) {
+      return;
+    }
+
+    controller.abort(RequestError.requestCancelled({ requestId }));
   }
 
   private closedReason(): unknown {
@@ -1134,6 +1295,20 @@ export class RequestError extends Error {
     return new RequestError(
       -32603,
       `Internal error${additionalMessage ? `: ${additionalMessage}` : ""}`,
+      data,
+    );
+  }
+
+  /**
+   * Execution of the request was aborted.
+   */
+  static requestCancelled(
+    data?: unknown,
+    additionalMessage?: string,
+  ): RequestError {
+    return new RequestError(
+      -32800,
+      `Request cancelled${additionalMessage ? `: ${additionalMessage}` : ""}`,
       data,
     );
   }
