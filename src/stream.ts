@@ -1,4 +1,6 @@
 import type { AnyMessage } from "./jsonrpc.js";
+import { isRecord } from "./jsonrpc.js";
+import { LineBuffer } from "./line-buffer.js";
 
 /**
  * Stream interface for ACP connections.
@@ -40,7 +42,29 @@ export function ndJsonStream(
 
   const readable = new ReadableStream<AnyMessage>({
     async start(controller) {
-      let content = "";
+      const lines = new LineBuffer();
+
+      const enqueueLine = (lineBytes: Uint8Array) => {
+        const trimmedLine = textDecoder.decode(lineBytes).trim();
+        if (trimmedLine) {
+          try {
+            const message: unknown = JSON.parse(trimmedLine);
+            // Skip non-object lines with a useful warning; anything
+            // object-shaped is left for the connection layer to validate.
+            if (isRecord(message)) {
+              controller.enqueue(message as AnyMessage);
+            } else {
+              console.warn(
+                "Skipping JSON line that is not an object:",
+                trimmedLine,
+              );
+            }
+          } catch (err) {
+            console.error("Failed to parse JSON message:", trimmedLine, err);
+          }
+        }
+      };
+
       const reader = input.getReader();
       inputReader = reader;
       try {
@@ -50,46 +74,24 @@ export function ndJsonStream(
             return;
           }
           if (done) {
-            content += textDecoder.decode();
             break;
           }
           if (!value) {
             continue;
           }
-          content += textDecoder.decode(value, { stream: true });
-          const lines = content.split("\n");
-          content = lines.pop() || "";
-
-          for (const line of lines) {
+          for (const line of lines.push(value)) {
+            enqueueLine(line);
             if (cancelled) {
               return;
-            }
-            const trimmedLine = line.trim();
-            if (trimmedLine) {
-              try {
-                const message = JSON.parse(trimmedLine) as AnyMessage;
-                controller.enqueue(message);
-              } catch (err) {
-                console.error(
-                  "Failed to parse JSON message:",
-                  trimmedLine,
-                  err,
-                );
-              }
             }
           }
         }
         if (cancelled) {
           return;
         }
-        const trimmedLine = content.trim();
-        if (trimmedLine) {
-          try {
-            const message = JSON.parse(trimmedLine) as AnyMessage;
-            controller.enqueue(message);
-          } catch (err) {
-            console.error("Failed to parse JSON message:", trimmedLine, err);
-          }
+        const lastLine = lines.flush();
+        if (lastLine) {
+          enqueueLine(lastLine);
         }
       } catch (err) {
         if (cancelled) {

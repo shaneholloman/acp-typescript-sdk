@@ -1,42 +1,20 @@
 import { describe, it, expect, vi } from "vitest";
 import { ndJsonStream } from "./stream.js";
-import type { AnyMessage } from "./jsonrpc.js";
-
-function readableFromChunks(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
-  return new ReadableStream({
-    start(controller) {
-      for (const chunk of chunks) {
-        controller.enqueue(chunk);
-      }
-      controller.close();
-    },
-  });
-}
-
-async function collectMessages(
-  readable: ReadableStream<AnyMessage>,
-): Promise<AnyMessage[]> {
-  const messages: AnyMessage[] = [];
-  const reader = readable.getReader();
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    messages.push(value);
-  }
-  return messages;
-}
+import {
+  chunkBytes,
+  collectStream,
+  streamFromChunks,
+} from "./test-support/streams.js";
 
 describe("ndJsonStream", () => {
   const nullWritable = new WritableStream<Uint8Array>();
 
   it("parses a single message", async () => {
     const msg = { jsonrpc: "2.0" as const, id: 1, method: "test" };
-    const input = readableFromChunks([
-      new TextEncoder().encode(JSON.stringify(msg) + "\n"),
-    ]);
+    const input = streamFromChunks([JSON.stringify(msg) + "\n"]);
 
     const { readable } = ndJsonStream(nullWritable, input);
-    const messages = await collectMessages(readable);
+    const messages = await collectStream(readable);
 
     expect(messages).toEqual([msg]);
   });
@@ -44,14 +22,12 @@ describe("ndJsonStream", () => {
   it("parses multiple messages", async () => {
     const msg1 = { jsonrpc: "2.0" as const, id: 1, method: "first" };
     const msg2 = { jsonrpc: "2.0" as const, id: 2, method: "second" };
-    const input = readableFromChunks([
-      new TextEncoder().encode(
-        JSON.stringify(msg1) + "\n" + JSON.stringify(msg2) + "\n",
-      ),
+    const input = streamFromChunks([
+      JSON.stringify(msg1) + "\n" + JSON.stringify(msg2) + "\n",
     ]);
 
     const { readable } = ndJsonStream(nullWritable, input);
-    const messages = await collectMessages(readable);
+    const messages = await collectStream(readable);
 
     expect(messages).toEqual([msg1, msg2]);
   });
@@ -60,17 +36,47 @@ describe("ndJsonStream", () => {
     const msg = { jsonrpc: "2.0" as const, id: 1, method: "split" };
     const full = JSON.stringify(msg) + "\n";
     const mid = Math.floor(full.length / 2);
-    const encoder = new TextEncoder();
 
-    const input = readableFromChunks([
-      encoder.encode(full.slice(0, mid)),
-      encoder.encode(full.slice(mid)),
-    ]);
+    const input = streamFromChunks([full.slice(0, mid), full.slice(mid)]);
 
     const { readable } = ndJsonStream(nullWritable, input);
-    const messages = await collectMessages(readable);
+    const messages = await collectStream(readable);
 
     expect(messages).toEqual([msg]);
+  });
+
+  it("parses a large message spanning many chunks", async () => {
+    const msg = {
+      jsonrpc: "2.0" as const,
+      id: 1,
+      method: "large",
+      params: { data: "héllo wörld ".repeat(10_000) },
+    };
+    const chunks = chunkBytes(JSON.stringify(msg) + "\n", 1024);
+    expect(chunks.length).toBeGreaterThan(100);
+
+    const { readable } = ndJsonStream(nullWritable, streamFromChunks(chunks));
+    const messages = await collectStream(readable);
+
+    expect(messages).toEqual([msg]);
+  });
+
+  it("parses messages when chunk boundaries fall mid-message", async () => {
+    const msg1 = { jsonrpc: "2.0" as const, id: 1, method: "first" };
+    const msg2 = { jsonrpc: "2.0" as const, id: 2, method: "second" };
+    const msg3 = { jsonrpc: "2.0" as const, id: 3, method: "third" };
+    const full = [msg1, msg2, msg3]
+      .map((m) => JSON.stringify(m) + "\n")
+      .join("");
+
+    // One chunk ends with a complete message plus the start of the next.
+    const cut = full.indexOf('"second"');
+    const input = streamFromChunks([full.slice(0, cut), full.slice(cut)]);
+
+    const { readable } = ndJsonStream(nullWritable, input);
+    const messages = await collectStream(readable);
+
+    expect(messages).toEqual([msg1, msg2, msg3]);
   });
 
   it("handles multi-byte UTF-8 characters split across chunks", async () => {
@@ -86,25 +92,23 @@ describe("ndJsonStream", () => {
     const éOffset = bytes.indexOf(0xc3);
     expect(éOffset).toBeGreaterThan(0);
 
-    const input = readableFromChunks([
+    const input = streamFromChunks([
       bytes.slice(0, éOffset + 1), // includes 0xC3 but not 0xA9
       bytes.slice(éOffset + 1), // starts with 0xA9
     ]);
 
     const { readable } = ndJsonStream(nullWritable, input);
-    const messages = await collectMessages(readable);
+    const messages = await collectStream(readable);
 
     expect(messages).toEqual([msg]);
   });
 
   it("parses a final message without trailing newline", async () => {
     const msg = { jsonrpc: "2.0" as const, id: 1, method: "unterminated" };
-    const input = readableFromChunks([
-      new TextEncoder().encode(JSON.stringify(msg)), // no \n
-    ]);
+    const input = streamFromChunks([JSON.stringify(msg)]); // no \n
 
     const { readable } = ndJsonStream(nullWritable, input);
-    const messages = await collectMessages(readable);
+    const messages = await collectStream(readable);
 
     expect(messages).toEqual([msg]);
   });
@@ -119,13 +123,13 @@ describe("ndJsonStream", () => {
     const éOffset = bytes.indexOf(0xc3);
     expect(éOffset).toBeGreaterThan(0);
 
-    const input = readableFromChunks([
+    const input = streamFromChunks([
       bytes.slice(0, éOffset + 1), // includes 0xC3 but not 0xAB
       bytes.slice(éOffset + 1),
     ]);
 
     const { readable } = ndJsonStream(nullWritable, input);
-    const messages = await collectMessages(readable);
+    const messages = await collectStream(readable);
 
     expect(messages).toEqual([msg]);
   });
@@ -136,23 +140,62 @@ describe("ndJsonStream", () => {
       .mockImplementation(() => undefined);
     const msg1 = { jsonrpc: "2.0" as const, id: 1, method: "before" };
     const msg2 = { jsonrpc: "2.0" as const, id: 2, method: "after" };
-    const input = readableFromChunks([
-      new TextEncoder().encode(
-        JSON.stringify(msg1) +
-          "\n" +
-          "not valid json\n" +
-          JSON.stringify(msg2) +
-          "\n",
-      ),
+    const input = streamFromChunks([
+      JSON.stringify(msg1) +
+        "\n" +
+        "not valid json\n" +
+        JSON.stringify(msg2) +
+        "\n",
     ]);
 
     const { readable } = ndJsonStream(nullWritable, input);
-    const messages = await collectMessages(readable);
+    const messages = await collectStream(readable);
 
     expect(messages).toEqual([msg1, msg2]);
     expect(error).toHaveBeenCalledOnce();
 
     error.mockRestore();
+  });
+
+  it("skips non-object JSON lines that would break the connection layer", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const msg1 = { jsonrpc: "2.0" as const, id: 1, method: "before" };
+    const msg2 = { jsonrpc: "2.0" as const, id: 2, method: "after" };
+    const input = streamFromChunks([
+      JSON.stringify(msg1) +
+        "\n" +
+        '42\n"str"\nnull\n' +
+        JSON.stringify(msg2) +
+        "\n",
+    ]);
+
+    const { readable } = ndJsonStream(nullWritable, input);
+    const messages = await collectStream(readable);
+
+    expect(messages).toEqual([msg1, msg2]);
+    expect(warn).toHaveBeenCalledTimes(3);
+
+    warn.mockRestore();
+  });
+
+  it("passes through object messages without validating their shape", async () => {
+    // Lenient peers may omit the jsonrpc field or send unusual response
+    // shapes; the connection layer decides how to handle them.
+    const lenient = { id: 1, method: "initialize", params: {} };
+    const bothMembers = {
+      jsonrpc: "2.0" as const,
+      id: 2,
+      result: {},
+      error: null,
+    };
+    const input = streamFromChunks([
+      JSON.stringify(lenient) + "\n" + JSON.stringify(bothMembers) + "\n",
+    ]);
+
+    const { readable } = ndJsonStream(nullWritable, input);
+    const messages = await collectStream(readable);
+
+    expect(messages).toEqual([lenient, bothMembers]);
   });
 
   it("cancels the underlying input reader when canceled", async () => {
